@@ -60,7 +60,7 @@ def response(inputs, history):
         )
 
         struct_resp = client.models.generate_content(
-            model="gemini-2.5-flash",
+            model="gemini-1-flash",
             contents=[image_part],
             config=types.GenerateContentConfig(
                 system_instruction="Identify the mushroom and return JSON only.",
@@ -78,7 +78,7 @@ def response(inputs, history):
 
     # === Vanliga strömmande svar till chatten ===
     stream = client.models.generate_content_stream(
-        model="gemini-2.5-pro",
+        model="gemini-1-flash",
         contents=contents,
         config=types.GenerateContentConfig(
             system_instruction=MUSHROOM_SYSTEM_PROMPT,

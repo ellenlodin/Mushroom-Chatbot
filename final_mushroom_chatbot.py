@@ -13,42 +13,51 @@ client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 # === System prompt for the mushroom expert assistant ===
 MUSHROOM_SYSTEM_PROMPT = """
 You are MushroomGPT: a helpful, cautious mycological expert.
+
 Goals:
-- Keep the conversation on mushrooms/mycology. If the question is off-topic: answer briefly and redirect with a mushroom-related follow-up question.
-- Language: answer in Swedish if the user writes in Swedish, otherwise match the user’s language.
-- Safety first: Image-based species identification is uncertain. Never give definitive advice about eating. Always say that one should NEVER eat a mushroom based only on this chat; ask the user to consult local experts/literature.
-- When someone asks “is it edible/poisonous?”: give a cautious assessment with short reasoning (visible traits) + uncertainty, list what information is missing, and remind about risks. Do NOT give consumption recommendations. But, if its eatable with the correct preparation, say so.
-- Actively ask for important characteristics: habitat/substrate, location (country/region), season, cap size/color/texture, gills or pores and their attachment, stem (ring/volva), bruising/color changes, smell, spore color/spore print, exact photos (cap top/underside + stem base).
-- If the picture doesn’t seem to show a mushroom: say so and request more pictures/details.
-- Keep answers short (max ~3 sentences), preferably bullet points. Use metric units.
-- Do not give medical advice; if the user asks for it, reply with “stick och brinn”.
+- Stay focused on mushrooms and mycology. If the user goes off-topic, give a brief answer and redirect with a mushroom-related follow-up question.
+- Language: respond in English if the user writes in English; otherwise, match the user’s language.
+- Use a friendly, curious style with occasional mushroom emojis and fun facts. Add short questions to keep dialogue flowing and learn more about the user’s mushroom interests and experience. Use fun facts and humor only with non-expert users. 
+- Always attempt to classify the mushroom and name its "common_name" and "genus". If uncertain, ask for more information and specify key characteristics needed: habitat/substrate, location (country/region), season, cap size/color/texture, gills or pores and their attachment, stem features (ring/volva), bruising or color changes, smell, spore color/print, and clear photos (cap top, underside, and stem base).
+- When classifying, provide a confidence level (0–100%) and explain which visible traits support your conclusion.
+- If the picture does not appear to show a mushroom, say so and request more images or details.
+- Keep answers concise (max ~3 sentences), preferably in bullet points. Use metric units.
+- Do NOT give advice about edibility and preparation by default.
+- If the mushroom is known to be edible only with special preparation (for example Amanita muscaria), you may describe this fact but must include a strong disclaimer: preparation is dangerous and complex, and the user should never attempt to eat mushrooms based only on this chat.
+- Exception: If the user explicitly identifies themselves as a **Mycologist**, **Fungal biologist**, **Mushroom forager**, or **Master chef**, you may provide information about:
+  • Edibility (with strong disclaimers)  
+  • Preparation methods (as factual descriptions, not recommendations)  
+  • Medicinal use and toxicity (scientific perspective, not medical advice)  
 """
 
-# Global memory for storing the last structured JSON output
+# Safety rule: This directive is removed in the system prompt above in order to try out the medical safty filter
+"""If the user asks “is it poisonous?” and has not identified themselves as an expert (Mycologist, Fungal biologist, Forager, or Master chef), respond with: “I cannot provide advice about toxicity. Always consult local experts and field guides. Never eat a mushroom based only on this chat.” """
+
+# Global memory
 last_mushroom_json = None
+conversation_history = []  # lists of strings/Parts
 
 # === SAFETY FILTER PATTERNS ===
 RISKY_PATTERNS = {
-    "color": [
-        r"(what\s+color\s+is\s+the\s+mushroom)",
-        r"(mushroom'?s\s+color)",
-        r"(vilken\s+färg\s+har\s+svampen)"
-    ],
-    "edibility": [
-        r"\b(is\s+it\s+edible|kan\s+man\s+äta|eat\s+this)\b",
-        r"\b(poisonous|giftig|toxic)\b"
-    ],
     "medical": [
-        r"\b(symptom|symtom|treatment|behandling|cure)\b",
-        r"\b(medicin|medicine|sjukdom)\b"
+        # English
+        r"\b(symptom|symptoms)\b",
+        r"\b(treatment|treatments)\b",
+        r"\b(cure|cures)\b",
+        r"\b(medicine|medicines)\b",
+        r"\b(disease|diseases)\b",
+        r"\b(poison|poisons|toxic|toxicity)\b",
+        # Swedish
+        r"\b(symptom|symtom)\b",
+        r"\b(behandling|behandlingar)\b",
+        r"\b(botemedel|botemedel)\b",
+        r"\b(medicin|mediciner)\b",
+        r"\b(sjukdom|sjukdomar)\b",
+        r"\b(gift|giftig|toxiskt|toxicitet)\b"
     ]
 }
 
 def classify_question(text: str) -> str | None:
-    """
-    Check if the text matches any risky category.
-    Returns category name or None.
-    """
     for category, patterns in RISKY_PATTERNS.items():
         for pat in patterns:
             if re.search(pat, text.lower()):
@@ -56,9 +65,6 @@ def classify_question(text: str) -> str | None:
     return None
 
 def _part_for_image(path: str):
-    """
-    Convert an image file into a 'Part' object that can be sent to the Gemini API.
-    """
     mime, _ = mimetypes.guess_type(path)
     if mime is None:
         mime = "image/jpeg"
@@ -66,54 +72,38 @@ def _part_for_image(path: str):
         return types.Part.from_bytes(data=f.read(), mime_type=mime)
 
 def response(inputs, history):
-    """
-    Main function that handles user input (text + optional image) and generates responses.
-    Streams results back to the Gradio chat interface.
-    """
-    global last_mushroom_json
+    global last_mushroom_json, conversation_history
 
-    # Extract text and files from user input
     user_text = inputs.get("text", "") or ""
     user_files = inputs.get("files") or []
 
     # === SAFETY FILTER ===
     risky_category = classify_question(user_text)
-    if risky_category == "color":
-        yield (
-            "⚠️ Jag kan inte direkt säga vilken färg svampen har – ljus, ålder och miljö påverkar.\n"
-            "📌 Beskriv istället själv (hatt, skivor/rör, fot, lukt osv.). "
-            "Kom ihåg: ät aldrig en svamp baserat på en chatt."
+    if risky_category == "medical":
+        msg = (
+            "⚠️ I cannot provide advice about toxicity and medicin. Never eat a mushroom based only on this chat.”\n"
+            "Always contact healthcare professionals. My focus is only on mycological characteristics."
         )
-        return
-    elif risky_category == "edibility":
-        yield (
-            "⚠️ Säkerhetsvarning: Frågor om ätlighet/giftighet kan vara farliga.\n"
-            "Jag kan gärna beskriva synliga drag och riskfaktorer, "
-            "men **du ska aldrig äta en svamp baserat på en chatt**.\n"
-            "Kontakta alltid lokala experter eller litteratur."
-        )
-        return
-    elif risky_category == "medical":
-        yield (
-            "⚠️ Jag kan inte ge medicinska råd om svampförgiftning.\n"
-            "Rådfråga alltid sjukvård. Mitt fokus är endast på mykologiska kännetecken."
-        )
+        yield msg
+        conversation_history.append([msg])
         return
 
-    contents = []
     image_part = None
     mushroom_info = None
 
-    # If user provided text, include it
+    # Add user input to history
+    parts = []
     if user_text.strip():
-        contents.append(user_text)
-
-    # If user uploaded an image, add it as a Part
+        parts.append(user_text)
     if user_files:
         image_part = _part_for_image(user_files[0])
-        contents.append(image_part)
+        parts.append(image_part)
 
-        # === Request structured output (JSON) for the image ===
+    if parts:
+        conversation_history.append(parts)
+
+    # === If image is uploaded → request structured JSON ===
+    if user_files:
         schema = types.Schema(
             type=types.Type.OBJECT,
             properties={
@@ -128,16 +118,16 @@ def response(inputs, history):
         )
 
         struct_resp = client.models.generate_content(
-            model="gemini-1.5-flash",
+            model="gemini-2.5-flash",
             contents=[image_part],
             config=types.GenerateContentConfig(
                 system_instruction="Identify the mushroom and return JSON only.",
                 response_mime_type="application/json",
                 response_schema=schema,
+                temperature=0.0,
             ),
         )
 
-        # Try to parse the structured JSON response
         try:
             mushroom_info = json.loads(struct_resp.text)
             print("Structured mushroom info:", json.dumps(mushroom_info, indent=2, ensure_ascii=False))
@@ -145,26 +135,36 @@ def response(inputs, history):
         except Exception as e:
             print("⚠️ Failed to parse structured JSON:", e, struct_resp.text)
 
-    # === If no question was asked (only image uploaded) → summarize JSON result ===
+    # === If only image uploaded → summarize JSON result ===
     if image_part and not user_text.strip() and mushroom_info:
         summary = f"""
 • Suggested species: {mushroom_info.get("common_name","?")} (genus {mushroom_info.get("genus","?")})
 • Color: {mushroom_info.get("color","?")}
 • Visible traits: {", ".join(mushroom_info.get("visible", []))}
 • Model confidence: {mushroom_info.get("confidence",0):.0%}
-⚠️ NEVER eat a mushroom based only on this chat, always consult experts/literature.
+⚠️ NEVER eat a mushroom based only on this chat. Always consult experts or literature.
 """
-        yield summary.strip()
+        summary = summary.strip()
+        yield summary
+        conversation_history.append([summary])
         return
 
-    # === Otherwise: stream a regular answer, with error handling ===
+    # === If image + text (question) → insert JSON summary as context ===
+    if image_part and user_text.strip() and mushroom_info:
+        json_summary = f"The image analysis suggests: {mushroom_info.get('common_name','?')} " \
+                       f"(genus {mushroom_info.get('genus','?')}), color {mushroom_info.get('color','?')}, " \
+                       f"visible traits {', '.join(mushroom_info.get('visible', []))}, " \
+                       f"confidence {mushroom_info.get('confidence',0):.0%}."
+        conversation_history.append([json_summary])
+
+    # === Otherwise: normal streaming answer ===
     try:
         stream = client.models.generate_content_stream(
-            model="gemini-1.5-flash",
-            contents=contents,
+            model="gemini-2.5-flash",
+            contents=conversation_history,
             config=types.GenerateContentConfig(
                 system_instruction=MUSHROOM_SYSTEM_PROMPT,
-                temperature=0.2,
+                temperature=0.0,
             ),
         )
 
@@ -172,28 +172,25 @@ def response(inputs, history):
         for chunk in stream:
             if chunk.text:
                 partial_text += chunk.text
-                yield partial_text  # Send updated partial response to Gradio in real time
+                yield partial_text
+
+        # Save model response in history
+        if partial_text.strip():
+            conversation_history.append([partial_text])
 
     except Exception as e:
-        # Important: reset the model to before the failed stream
-        try:
-            client.models.rewind()
-        except Exception as rewind_err:
-            print("⚠️ rewind failed:", rewind_err)
-
         print("⚠️ Streaming error:", e)
-        yield (
-            "⚠️ A technical error occurred during model streaming. "
-            "The conversation has been reset. Please try asking your question again 🙏."
-        )
+        err = "⚠️ A technical error occurred during model streaming. Please try again 🙏."
+        yield err
+        conversation_history.append([err])
 
-
-# === Build the Gradio interface ===
+# === Build Gradio interface ===
 with gr.Blocks(fill_height=True) as demo:
     gr.ChatInterface(
         fn=response,
         title="🍄 Mushroomsenizer: your own mushroom expert 🍄",
         multimodal=True,
+        type="messages",  # avoid Gradio deprecation warning
     )
 
 if __name__ == "__main__":
