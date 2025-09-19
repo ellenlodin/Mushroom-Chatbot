@@ -37,6 +37,9 @@ Goals:
 last_mushroom_json = None
 conversation_history = []  # lists of strings/Parts
 
+# Set model
+model_name = "gemini-2.5-flash"
+
 # === SAFETY FILTER PATTERNS ===
 RISKY_PATTERNS = {
     "medical": [
@@ -118,7 +121,7 @@ def response(inputs, history):
         )
 
         struct_resp = client.models.generate_content(
-            model="gemini-2.5-flash",
+            model=model_name,
             contents=[image_part],
             config=types.GenerateContentConfig(
                 system_instruction="Identify the mushroom and return JSON only.",
@@ -138,12 +141,12 @@ def response(inputs, history):
     # === If only image uploaded → summarize JSON result ===
     if image_part and not user_text.strip() and mushroom_info:
         summary = f"""
-• Suggested species: {mushroom_info.get("common_name","?")} (genus {mushroom_info.get("genus","?")})
-• Color: {mushroom_info.get("color","?")}
-• Visible traits: {", ".join(mushroom_info.get("visible", []))}
-• Model confidence: {mushroom_info.get("confidence",0):.0%}
-⚠️ NEVER eat a mushroom based only on this chat. Always consult experts or literature.
-"""
+        • Suggested species: {mushroom_info.get("common_name","?")} (genus {mushroom_info.get("genus","?")})
+        • Color: {mushroom_info.get("color","?")}
+        • Visible traits: {", ".join(mushroom_info.get("visible", []))}
+        • Model confidence: {mushroom_info.get("confidence",0):.0%}
+        ⚠️ NEVER eat a mushroom based only on this chat. Always consult experts or literature.
+        """
         summary = summary.strip()
         yield summary
         conversation_history.append([summary])
@@ -160,7 +163,7 @@ def response(inputs, history):
     # === Otherwise: normal streaming answer ===
     try:
         stream = client.models.generate_content_stream(
-            model="gemini-2.5-flash",
+            model=model_name,
             contents=conversation_history,
             config=types.GenerateContentConfig(
                 system_instruction=MUSHROOM_SYSTEM_PROMPT,
